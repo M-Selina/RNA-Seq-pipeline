@@ -1,0 +1,711 @@
+#!/usr/bin/env python3
+"""
+Python-Native RNA-seq Analysis Pipeline
+A comprehensive pipeline using Python libraries for RNA-seq data analysis
+"""
+
+import os
+import sys
+import subprocess
+import argparse
+import logging
+import json
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import multiprocessing
+from collections import defaultdict
+import gzip
+import re
+
+# Bioinformatics libraries
+try:
+    import pysam
+    import pyfaidx
+    from Bio import SeqIO
+    try:
+        from Bio.SeqUtils import GC
+    except ImportError:
+        # Fallback GC calculation function
+        def GC(seq):
+            gc_count = seq.upper().count('G') + seq.upper().count('C')
+            return (gc_count / len(seq)) * 100 if len(seq) > 0 else 0
+except ImportError as e:
+    print(f"Warning: Some bioinformatics libraries not found: {e}")
+    print("Install with: pip install pysam pyfaidx biopython")
+    # Fallback GC calculation function
+    def GC(seq):
+        gc_count = seq.upper().count('G') + seq.upper().count('C')
+        return (gc_count / len(seq)) * 100 if len(seq) > 0 else 0
+
+class FastQCAnalyzer:
+    """Pure Python FastQ quality control analyzer"""
+    
+    def __init__(self):
+        self.quality_scores = []
+        self.sequence_lengths = []
+        self.gc_contents = []
+        self.n_counts = []
+        
+    def analyze_fastq(self, fastq_file):
+        """Analyze a FASTQ file and return quality metrics"""
+        opener = gzip.open if fastq_file.endswith('.gz') else open
+        mode = 'rt' if fastq_file.endswith('.gz') else 'r'
+        
+        read_count = 0
+        total_bases = 0
+        quality_sum = 0
+        
+        with opener(fastq_file, mode) as f:
+            while True:
+                try:
+                    # Read 4 lines (FASTQ record)
+                    header = f.readline().strip()
+                    if not header:
+                        break
+                        
+                    sequence = f.readline().strip()
+                    plus = f.readline().strip()
+                    quality = f.readline().strip()
+                    
+                    if not all([header, sequence, plus, quality]):
+                        break
+                        
+                    read_count += 1
+                    total_bases += len(sequence)
+                    
+                    # Calculate metrics
+                    self.sequence_lengths.append(len(sequence))
+                    self.gc_contents.append(GC(sequence))
+                    self.n_counts.append(sequence.count('N'))
+                    
+                    # Quality scores (convert from ASCII)
+                    qual_scores = [ord(q) - 33 for q in quality]
+                    self.quality_scores.extend(qual_scores)
+                    quality_sum += sum(qual_scores)
+                    
+                except Exception as e:
+                    print(f"Error processing read {read_count}: {e}")
+                    continue
+                    
+        return {
+            'total_reads': read_count,
+            'total_bases': total_bases,
+            'avg_quality': quality_sum / total_bases if total_bases > 0 else 0,
+            'avg_length': np.mean(self.sequence_lengths) if self.sequence_lengths else 0,
+            'avg_gc_content': np.mean(self.gc_contents) if self.gc_contents else 0,
+            'avg_n_content': np.mean(self.n_counts) if self.n_counts else 0
+        }
+        
+    def generate_plots(self, output_dir, sample_name):
+        """Generate quality control plots"""
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        fig.suptitle(f'Quality Control Report - {sample_name}')
+        
+        # Quality score distribution
+        axes[0,0].hist(self.quality_scores, bins=50, alpha=0.7)
+        axes[0,0].set_xlabel('Quality Score')
+        axes[0,0].set_ylabel('Frequency')
+        axes[0,0].set_title('Quality Score Distribution')
+        
+        # Sequence length distribution
+        axes[0,1].hist(self.sequence_lengths, bins=50, alpha=0.7)
+        axes[0,1].set_xlabel('Sequence Length')
+        axes[0,1].set_ylabel('Frequency')
+        axes[0,1].set_title('Sequence Length Distribution')
+        
+        # GC content distribution
+        axes[1,0].hist(self.gc_contents, bins=50, alpha=0.7)
+        axes[1,0].set_xlabel('GC Content (%)')
+        axes[1,0].set_ylabel('Frequency')
+        axes[1,0].set_title('GC Content Distribution')
+        
+        # N content distribution
+        axes[1,1].hist(self.n_counts, bins=50, alpha=0.7)
+        axes[1,1].set_xlabel('N Count per Read')
+        axes[1,1].set_ylabel('Frequency')
+        axes[1,1].set_title('N Content Distribution')
+        
+        plt.tight_layout()
+        plt.savefig(Path(output_dir) / f'{sample_name}_qc_report.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+class ReadTrimmer:
+    """Pure Python read trimmer"""
+    
+    def __init__(self, min_quality=20, min_length=50):
+        self.min_quality = min_quality
+        self.min_length = min_length
+        
+    def trim_read(self, sequence, quality):
+        """Trim a single read based on quality"""
+        qual_scores = [ord(q) - 33 for q in quality]
+        
+        # Find trim positions
+        start = 0
+        end = len(sequence)
+        
+        # Trim from start
+        for i, q in enumerate(qual_scores):
+            if q >= self.min_quality:
+                start = i
+                break
+                
+        # Trim from end
+        for i in range(len(qual_scores)-1, -1, -1):
+            if qual_scores[i] >= self.min_quality:
+                end = i + 1
+                break
+                
+        # Check minimum length
+        if (end - start) < self.min_length:
+            return None, None
+            
+        return sequence[start:end], quality[start:end]
+        
+    def trim_fastq_file(self, input_file, output_file):
+        """Trim an entire FASTQ file"""
+        opener_in = gzip.open if input_file.endswith('.gz') else open
+        opener_out = gzip.open if output_file.endswith('.gz') else open
+        mode_in = 'rt' if input_file.endswith('.gz') else 'r'
+        mode_out = 'wt' if output_file.endswith('.gz') else 'w'
+        
+        trimmed_count = 0
+        discarded_count = 0
+        
+        with opener_in(input_file, mode_in) as infile, opener_out(output_file, mode_out) as outfile:
+            while True:
+                # Read FASTQ record
+                header = infile.readline()
+                if not header:
+                    break
+                    
+                sequence = infile.readline().strip()
+                plus = infile.readline()
+                quality = infile.readline().strip()
+                
+                # Trim read
+                trimmed_seq, trimmed_qual = self.trim_read(sequence, quality)
+                
+                if trimmed_seq:
+                    outfile.write(header)
+                    outfile.write(trimmed_seq + '\n')
+                    outfile.write(plus)
+                    outfile.write(trimmed_qual + '\n')
+                    trimmed_count += 1
+                else:
+                    discarded_count += 1
+                    
+        return trimmed_count, discarded_count
+
+class ExpressionAnalyzer:
+    """Pure Python differential expression analyzer"""
+    
+    def __init__(self):
+        self.count_matrix = None
+        self.sample_info = None
+        
+    def load_count_matrix(self, count_file):
+        """Load gene count matrix"""
+        self.count_matrix = pd.read_csv(count_file, index_col=0, sep='\t')
+        return self.count_matrix
+        
+    def load_sample_info(self, sample_file):
+        """Load sample information"""
+        self.sample_info = pd.read_csv(sample_file, index_col=0)
+        return self.sample_info
+        
+    def normalize_counts(self, method='rle'):
+        """Normalize count data using different methods"""
+        if method == 'rle':
+            # Relative Log Expression (similar to DESeq2)
+            log_counts = np.log2(self.count_matrix + 1)
+            log_means = log_counts.mean(axis=1)
+            ratios = log_counts.subtract(log_means, axis=0)
+            size_factors = np.exp(ratios.median(axis=0))
+            normalized = self.count_matrix.div(size_factors, axis=1)
+            
+        elif method == 'tpm':
+            # Transcripts Per Million (TPM)
+            # Note: This is simplified - real TPM needs gene lengths
+            rate = self.count_matrix.div(self.count_matrix.sum(axis=0), axis=1)
+            normalized = rate * 1e6
+            
+        elif method == 'cpm':
+            # Counts Per Million
+            normalized = self.count_matrix.div(self.count_matrix.sum(axis=0), axis=1) * 1e6
+            
+        return normalized
+        
+    def perform_simple_differential_analysis(self, group1, group2):
+        """Simple differential expression analysis using fold change and t-test"""
+        from scipy import stats
+        
+        group1_samples = self.sample_info[self.sample_info['condition'] == group1].index
+        group2_samples = self.sample_info[self.sample_info['condition'] == group2].index
+        
+        results = []
+        
+        for gene in self.count_matrix.index:
+            g1_counts = self.count_matrix.loc[gene, group1_samples]
+            g2_counts = self.count_matrix.loc[gene, group2_samples]
+            
+            # Calculate means
+            g1_mean = g1_counts.mean()
+            g2_mean = g2_counts.mean()
+            
+            # Calculate fold change
+            fold_change = (g2_mean + 1) / (g1_mean + 1)
+            log2_fc = np.log2(fold_change)
+            
+            # Perform t-test
+            try:
+                t_stat, p_value = stats.ttest_ind(g1_counts, g2_counts)
+            except:
+                p_value = 1.0
+                
+            results.append({
+                'gene': gene,
+                'group1_mean': g1_mean,
+                'group2_mean': g2_mean,
+                'fold_change': fold_change,
+                'log2_fold_change': log2_fc,
+                'p_value': p_value
+            })
+            
+        results_df = pd.DataFrame(results)
+        
+        # Multiple testing correction (Benjamini-Hochberg)
+        from statsmodels.stats.multitest import multipletests
+        _, results_df['adj_p_value'], _, _ = multipletests(
+            results_df['p_value'], method='fdr_bh'
+        )
+        
+        return results_df.sort_values('p_value')
+        
+    def generate_de_plots(self, results_df, output_dir):
+        """Generate differential expression plots"""
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        
+        # Volcano plot
+        x = results_df['log2_fold_change']
+        y = -np.log10(results_df['adj_p_value'])
+        
+        # Color points based on significance
+        colors = ['red' if (abs(fc) > 1 and pval < 0.05) else 'gray' 
+                 for fc, pval in zip(x, results_df['adj_p_value'])]
+        
+        axes[0,0].scatter(x, y, c=colors, alpha=0.6, s=10)
+        axes[0,0].set_xlabel('Log2 Fold Change')
+        axes[0,0].set_ylabel('-Log10 Adjusted P-value')
+        axes[0,0].set_title('Volcano Plot')
+        axes[0,0].axhline(y=-np.log10(0.05), color='black', linestyle='--', alpha=0.5)
+        axes[0,0].axvline(x=1, color='black', linestyle='--', alpha=0.5)
+        axes[0,0].axvline(x=-1, color='black', linestyle='--', alpha=0.5)
+        
+        # MA plot
+        A = (np.log2(results_df['group1_mean'] + 1) + np.log2(results_df['group2_mean'] + 1)) / 2
+        M = results_df['log2_fold_change']
+        
+        axes[0,1].scatter(A, M, c=colors, alpha=0.6, s=10)
+        axes[0,1].set_xlabel('Average Log2 Expression')
+        axes[0,1].set_ylabel('Log2 Fold Change')
+        axes[0,1].set_title('MA Plot')
+        axes[0,1].axhline(y=0, color='black', linestyle='-', alpha=0.5)
+        
+        # P-value distribution
+        axes[1,0].hist(results_df['p_value'], bins=50, alpha=0.7)
+        axes[1,0].set_xlabel('P-value')
+        axes[1,0].set_ylabel('Frequency')
+        axes[1,0].set_title('P-value Distribution')
+        
+        # Top DE genes
+        top_genes = results_df.head(20)
+        y_pos = np.arange(len(top_genes))
+        axes[1,1].barh(y_pos, -np.log10(top_genes['adj_p_value']))
+        axes[1,1].set_yticks(y_pos)
+        axes[1,1].set_yticklabels(top_genes['gene'])
+        axes[1,1].set_xlabel('-Log10 Adjusted P-value')
+        axes[1,1].set_title('Top 20 DE Genes')
+        
+        plt.tight_layout()
+        plt.savefig(Path(output_dir) / 'differential_expression_plots.png', 
+                   dpi=300, bbox_inches='tight')
+        plt.close()
+
+class RNASeqPipeline:
+    def __init__(self, config_file=None):
+        self.setup_logging()
+        self.config = self.load_config(config_file)
+        self.create_directories()
+        
+    def setup_logging(self):
+        """Setup logging configuration"""
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('rnaseq_pipeline.log'),
+                logging.StreamHandler(sys.stdout)
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+        
+    def load_config(self, config_file):
+        """Load pipeline configuration"""
+        if config_file and os.path.exists(config_file):
+            with open(config_file, 'r') as f:
+                return json.load(f)
+        else:
+            return {
+                "reference_genome": "/path/to/genome.fa",
+                "annotation_gtf": "/path/to/annotation.gtf",
+                "input_dir": "/Users/selina/Desktop/raw data/SRR292241.fastq",
+                "output_dir": "/Users/selina/Desktop/output rna seq new",
+                "threads": multiprocessing.cpu_count(),
+                "min_quality": 20,
+                "min_length": 50,
+                "use_python_tools": True,  # Use Python implementations when available
+                "external_tools": {
+                    "star": "STAR",
+                    "salmon": "salmon",
+                    "featurecounts": "featureCounts"
+                }
+            }
+    
+    def create_directories(self):
+        """Create output directories"""
+        dirs = [
+            "qc_raw", "qc_trimmed", "trimmed", 
+            "aligned", "counts", "salmon_quant", "logs", "reports"
+        ]
+        
+        for d in dirs:
+            path = Path(self.config['output_dir']) / d
+            path.mkdir(parents=True, exist_ok=True)
+            
+    def get_sample_files(self):
+        """Get list of FASTQ files and parse sample names"""
+        input_dir = Path(self.config['input_dir'])
+        fastq_files = list(input_dir.glob("*.fastq.gz")) + list(input_dir.glob("*.fq.gz"))
+        fastq_files += list(input_dir.glob("*.fastq")) + list(input_dir.glob("*.fq"))
+        
+        samples = {}
+        for file in fastq_files:
+            # Parse sample names
+            if "_R1" in file.name or "_1" in file.name:
+                sample_name = re.sub(r'_R1\.f(ast)?q(\.gz)?$', '', file.name)
+                sample_name = re.sub(r'_1\.f(ast)?q(\.gz)?$', '', sample_name)
+                
+                # Look for R2/2 file
+                r2_patterns = [
+                    file.name.replace("_R1", "_R2"),
+                    file.name.replace("_1", "_2")
+                ]
+                
+                r2_file = None
+                for pattern in r2_patterns:
+                    potential_r2 = file.parent / pattern
+                    if potential_r2.exists():
+                        r2_file = potential_r2
+                        break
+                
+                samples[sample_name] = {
+                    "R1": str(file), 
+                    "R2": str(r2_file) if r2_file else None
+                }
+                
+        return samples
+        
+    def python_quality_control(self, samples, stage="raw"):
+        """Python-based quality control using FastQCAnalyzer"""
+        self.logger.info(f"Running Python QC for {stage} data")
+        
+        output_dir = Path(self.config['output_dir']) / f"qc_{stage}"
+        
+        def analyze_sample(sample_data):
+            sample, files = sample_data
+            analyzer = FastQCAnalyzer()
+            
+            # Analyze R1
+            if stage == "raw":
+                r1_file = files['R1']
+            else:
+                trimmed_dir = Path(self.config['output_dir']) / "trimmed"
+                r1_file = str(trimmed_dir / f"{sample}_R1_trimmed.fastq.gz")
+            
+            metrics = analyzer.analyze_fastq(r1_file)
+            analyzer.generate_plots(output_dir, f"{sample}_R1")
+            
+            # Analyze R2 if exists
+            if files['R2']:
+                analyzer2 = FastQCAnalyzer()
+                if stage == "raw":
+                    r2_file = files['R2']
+                else:
+                    r2_file = str(trimmed_dir / f"{sample}_R2_trimmed.fastq.gz")
+                
+                metrics2 = analyzer2.analyze_fastq(r2_file)
+                analyzer2.generate_plots(output_dir, f"{sample}_R2")
+                
+                return sample, metrics, metrics2
+            
+            return sample, metrics, None
+        
+        # Run analysis in parallel
+        with ProcessPoolExecutor(max_workers=self.config['threads']) as executor:
+            results = list(executor.map(analyze_sample, samples.items()))
+        
+        # Save summary report
+        summary_data = []
+        for sample, r1_metrics, r2_metrics in results:
+            summary_data.append({
+                'sample': sample,
+                'read': 'R1',
+                **r1_metrics
+            })
+            if r2_metrics:
+                summary_data.append({
+                    'sample': sample,
+                    'read': 'R2',
+                    **r2_metrics
+                })
+        
+        summary_df = pd.DataFrame(summary_data)
+        summary_df.to_csv(output_dir / f'{stage}_qc_summary.csv', index=False)
+        
+    def python_trim_reads(self, samples):
+        """Python-based read trimming"""
+        self.logger.info("Trimming reads with Python trimmer")
+        
+        trimmed_dir = Path(self.config['output_dir']) / "trimmed"
+        trimmer = ReadTrimmer(self.config['min_quality'], self.config['min_length'])
+        
+        def trim_sample(sample_data):
+            sample, files = sample_data
+            results = {}
+            
+            # Trim R1
+            output_r1 = trimmed_dir / f"{sample}_R1_trimmed.fastq.gz"
+            trimmed_count, discarded_count = trimmer.trim_fastq_file(files['R1'], str(output_r1))
+            results['R1'] = {'trimmed': trimmed_count, 'discarded': discarded_count}
+            
+            # Trim R2 if exists
+            if files['R2']:
+                output_r2 = trimmed_dir / f"{sample}_R2_trimmed.fastq.gz"
+                trimmed_count, discarded_count = trimmer.trim_fastq_file(files['R2'], str(output_r2))
+                results['R2'] = {'trimmed': trimmed_count, 'discarded': discarded_count}
+            
+            return sample, results
+        
+        # Run trimming in parallel
+        with ProcessPoolExecutor(max_workers=self.config['threads']) as executor:
+            results = list(executor.map(trim_sample, samples.items()))
+        
+        # Save trimming report
+        trim_data = []
+        for sample, trim_results in results:
+            for read, stats in trim_results.items():
+                trim_data.append({
+                    'sample': sample,
+                    'read': read,
+                    'trimmed_reads': stats['trimmed'],
+                    'discarded_reads': stats['discarded']
+                })
+        
+        trim_df = pd.DataFrame(trim_data)
+        trim_df.to_csv(trimmed_dir / 'trimming_summary.csv', index=False)
+        
+    def run_external_alignment(self, samples):
+        """Run external alignment tools (STAR, Salmon, etc.)"""
+        if 'star' in self.config.get('external_tools', {}):
+            self.logger.info("Running STAR alignment")
+            # Implementation for STAR would go here
+            # This would be similar to the original pipeline
+        
+        if 'salmon' in self.config.get('external_tools', {}):
+            self.logger.info("Running Salmon quantification")
+            # Implementation for Salmon would go here
+            
+    def python_differential_expression(self, count_file, sample_info_file):
+        """Python-based differential expression analysis"""
+        self.logger.info("Running Python-based differential expression analysis")
+        
+        analyzer = ExpressionAnalyzer()
+        
+        # Load data
+        count_matrix = analyzer.load_count_matrix(count_file)
+        sample_info = analyzer.load_sample_info(sample_info_file)
+        
+        # Get unique conditions
+        conditions = sample_info['condition'].unique()
+        if len(conditions) < 2:
+            self.logger.error("Need at least 2 conditions for DE analysis")
+            return
+        
+        # Perform analysis for first two conditions
+        group1, group2 = conditions[0], conditions[1]
+        results = analyzer.perform_simple_differential_analysis(group1, group2)
+        
+        # Save results
+        output_dir = Path(self.config['output_dir']) / 'reports'
+        results.to_csv(output_dir / 'differential_expression_results.csv', index=False)
+        
+        # Generate plots
+        analyzer.generate_de_plots(results, output_dir)
+        
+        self.logger.info(f"DE analysis complete. Found {len(results)} genes analyzed.")
+        
+    def create_sample_info_template(self):
+        """Create a template sample information file"""
+        samples = self.get_sample_files()
+        
+        sample_info = pd.DataFrame({
+            'sample': list(samples.keys()),
+            'condition': ['control'] * len(samples)
+        })
+        
+        template_path = Path(self.config['output_dir']) / "sample_info_template.csv"
+        sample_info.to_csv(template_path, index=False)
+        
+        return str(template_path)
+        
+    def run_python_pipeline(self):
+        """Run pipeline using Python implementations"""
+        self.logger.info("Starting Python-native RNA-seq pipeline")
+        
+        try:
+            samples = self.get_sample_files()
+            if not samples:
+                raise ValueError("No FASTQ files found")
+            
+            self.logger.info(f"Found {len(samples)} samples")
+            
+            # Create sample info template
+            sample_info_file = self.create_sample_info_template()
+            
+            # Quality control - raw reads
+            if self.config.get('use_python_tools', True):
+                self.python_quality_control(samples, "raw")
+            
+            # Trim reads
+            if self.config.get('use_python_tools', True):
+                self.python_trim_reads(samples)
+                
+                # Quality control - trimmed reads
+                self.python_quality_control(samples, "trimmed")
+            
+            # External alignment tools (if configured)
+            self.run_external_alignment(samples)
+            
+            # Generate summary report
+            self.generate_summary_report(samples)
+            
+            self.logger.info("Python pipeline completed successfully!")
+            
+        except Exception as e:
+            self.logger.error(f"Pipeline failed: {e}")
+            raise
+            
+    def generate_summary_report(self, samples):
+        """Generate a comprehensive HTML report"""
+        report_dir = Path(self.config['output_dir']) / 'reports'
+        
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>RNA-seq Pipeline Report</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 40px; }}
+                .header {{ background-color: #f0f0f0; padding: 20px; }}
+                .section {{ margin: 20px 0; }}
+                table {{ border-collapse: collapse; width: 100%; }}
+                th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+                th {{ background-color: #f2f2f2; }}
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1>RNA-seq Analysis Report</h1>
+                <p>Generated by Python RNA-seq Pipeline</p>
+            </div>
+            
+            <div class="section">
+                <h2>Pipeline Summary</h2>
+                <p>Total samples analyzed: {len(samples)}</p>
+                <p>Output directory: {self.config['output_dir']}</p>
+                <p>Quality threshold: {self.config['min_quality']}</p>
+                <p>Minimum read length: {self.config['min_length']}</p>
+            </div>
+            
+            <div class="section">
+                <h2>Sample Information</h2>
+                <table>
+                    <tr><th>Sample</th><th>R1 File</th><th>R2 File</th></tr>
+        """
+        
+        for sample, files in samples.items():
+            html_content += f"""
+                    <tr>
+                        <td>{sample}</td>
+                        <td>{Path(files['R1']).name}</td>
+                        <td>{Path(files['R2']).name if files['R2'] else 'N/A'}</td>
+                    </tr>
+            """
+        
+        html_content += """
+                </table>
+            </div>
+            
+            <div class="section">
+                <h2>Quality Control</h2>
+                <p>Quality control plots are available in the qc_raw and qc_trimmed directories.</p>
+            </div>
+            
+        </body>
+        </html>
+        """
+        
+        with open(report_dir / 'pipeline_report.html', 'w') as f:
+            f.write(html_content)
+
+def main():
+    parser = argparse.ArgumentParser(description="Python RNA-seq Analysis Pipeline")
+    parser.add_argument("--config", help="Configuration file (JSON)")
+    parser.add_argument("--sample-info", help="Sample information file (CSV)")
+    parser.add_argument("--input-dir", help="Directory containing FASTQ files")
+    parser.add_argument("--output-dir", help="Output directory for results")
+    parser.add_argument("--create-config", action="store_true", 
+                       help="Create configuration template")
+    parser.add_argument("--mode", choices=["python", "hybrid"], default="python",
+                       help="Pipeline mode: python (pure Python) or hybrid (Python + external tools)")
+    
+    args = parser.parse_args()
+    
+    if args.create_config:
+        pipeline = RNASeqPipeline()
+        pipeline.create_config_template()
+        return
+    
+    # Initialize pipeline
+    pipeline = RNASeqPipeline(args.config)
+    
+    # Override config with command line arguments
+    if args.input_dir:
+        pipeline.config['input_dir'] = args.input_dir
+    if args.output_dir:
+        pipeline.config['output_dir'] = args.output_dir
+        pipeline.create_directories()  # Recreate directories with new path
+    
+    if args.mode == "python":
+        pipeline.run_python_pipeline()
+    else:
+        # Hybrid mode - would combine Python and external tools
+        pipeline.logger.info("Hybrid mode not fully implemented yet")
+
+if __name__ == "__main__":
+    main()
